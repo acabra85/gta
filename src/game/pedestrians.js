@@ -26,6 +26,7 @@ import * as THREE from 'three'
 import {broadRadius, inBox, SHOULDER} from './vehicles.js'
 import {groundAt} from '../world/ground.js'
 import {createPose, strikeRagdoll, stepRagdoll, ragdollDuration} from './ragdoll.js'
+import {WEAK_MACHINE} from '../quality.js'
 
 /**
  * Master's curated palette, copied by agreement so scene.js can drop its own copy. It is the BRIGHT
@@ -64,8 +65,9 @@ const BAG_PALETTE = [0x3b3a38, 0x5a4636, 0x2f3d4a, 0x6b6257, 0x7a3f3a]
 const BAG_SHARE = 0.34
 
 // Density is what "alive" means. The simulation costs 0.08ms for 140, so the budget is not the
-// constraint — headroom measured, then spent.
-const COUNT = 340
+// constraint — headroom measured, then spent. WEAK_MACHINE still halves it: the simulation was
+// never the cost on a weak GPU, but fewer instances is fewer vertices the GPU has to move.
+const COUNT = WEAK_MACHINE ? 170 : 340
 const LOOK_RANGE = 22          // metres within which a head tracks the car
 const SIDEWALK = 1.4           // metres beyond the kerb
 /** Beyond this from the car a pedestrian is recycled; the ring is where they reappear. */

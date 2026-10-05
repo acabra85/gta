@@ -10,8 +10,9 @@ import {makeCarFleet} from '../render/car.js'
 import {fleetBox} from './vehicles.js'
 import {STOP_LINE, GREEN_LIGHT} from './signals.js'
 import {groundAt} from '../world/ground.js'
+import {WEAK_MACHINE} from '../quality.js'
 
-const COUNT = 120
+const COUNT = WEAK_MACHINE ? 60 : 120
 const CRUISE = 9.5              // m/s, about 34 km/h — city pace
 // 34 cars over a 220m radius measured one car per 4,500 square metres — real traffic that nobody
 // ever sees. The population is concentrated instead of enlarged: the streets you are on are busy,

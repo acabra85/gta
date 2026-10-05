@@ -2,10 +2,11 @@
 // handshake (§5, as amended in the telegraph): {scene, camera, renderer, update(dt, gameHours),
 // follow(target), makeCar(tint)}. Pedestrians are wholly the simulation's (one InstancedMesh).
 //
-// The whole city draws in under twenty calls on purpose — buildings are ONE merged geometry with
-// procedural facades in the shader, roads one, trees one instanced mesh, lamps a pole instance
-// plus one Points for the glows. "Extraordinary" here is art direction, not asset weight: the
-// night frame with six thousand individually lit windows is the shot, and it costs one material.
+// The whole city draws in a small, bounded number of calls on purpose — buildings are merged
+// geometry (one spatial chunk each, see CHUNK_SIZE in buildBuildings) with procedural facades in
+// the shader, roads one mesh, trees one instanced mesh, lamps a pole instance plus one Points for
+// the glows. "Extraordinary" here is art direction, not asset weight: the night frame with six
+// thousand individually lit windows is the shot, and it costs one material regardless of chunking.
 import * as THREE from 'three';
 import {ROAD_KINDS, PROP_KINDS} from '../world/model.js';
 import {makeCar, makeCarFleet} from './car.js';
@@ -20,6 +21,7 @@ import {buildParks} from './parks.js';
 import {setHeightfield, groundHeight, minGroundUnder, seatGroundUnder, hasTerrain} from '../world/terrain.js';
 import {makeDog, makePigeonFleet} from './critters.js';
 import {buildEasterEggs} from './eastereggs.js';
+import {WEAK_MACHINE, CHUNK_CULL_RADIUS} from '../quality.js';
 import {EffectComposer} from 'three/examples/jsm/postprocessing/EffectComposer.js';
 import {RenderPass} from 'three/examples/jsm/postprocessing/RenderPass.js';
 import {UnrealBloomPass} from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
@@ -79,10 +81,11 @@ export function createScene(world) {
   const camera = new THREE.PerspectiveCamera(62, 1, 0.5, DRAW + 400);
   camera.position.set(0, 60, 80);
 
-  const renderer = new THREE.WebGLRenderer({antialias: true, powerPreference: 'high-performance'});
+  const renderer = new THREE.WebGLRenderer({antialias: !WEAK_MACHINE, powerPreference: 'high-performance'});
   // Cap below devicePixelRatio (2 on this MacBook): ~2.3x fewer shaded pixels, invisible at 16".
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
-  renderer.shadowMap.enabled = true;
+  // WEAK_MACHINE caps at native resolution instead — no supersampling at all.
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, WEAK_MACHINE ? 1 : 1.5));
+  renderer.shadowMap.enabled = !WEAK_MACHINE;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -215,7 +218,7 @@ export function createScene(world) {
   const signals = buildSignals(world);
   scene.add(signals.group);
   scene.add(buildCathedral(world));
-  // --- buildings: ONE merged geometry, procedural facade shader ----------------------------
+  // --- buildings: one merged geometry per spatial chunk, procedural facade shader ----------
   const buildings = buildBuildings(world);
   scene.add(buildings.mesh);
   // --- green + water, flat tinted fills ----------------------------------------------------
@@ -339,7 +342,8 @@ export function createScene(world) {
   // --- townhouses: fill EMPTY residential frontages with terraces of varied 3-6 storey houses.
   // Purely additive — a house is only placed where its footprint hits no existing OSM building, so
   // the real city keeps its real buildings and only the bare stretches get dressed. --------------
-  scene.add(buildTownhouseFrontages(world));
+  const townhouses = buildTownhouseFrontages(world);
+  scene.add(townhouses);
   // --- street furniture: bollards, bins, benches, shelters, bike racks, signs, planters, hydrants,
   // laid along pavement edges of the busier streets so the city is dressed, not bare. Placed above,
   // before the trees, because the tree siting test has to know where it all ended up. ------------
@@ -382,11 +386,18 @@ export function createScene(world) {
   exposeDestruction(world, destruction);
 
   // --- bloom: the night glow. Threshold keeps daylight clean; strength rides the clock ----
-  const composer = new EffectComposer(renderer);
-  composer.addPass(new RenderPass(scene, camera));
-  const bloom = new UnrealBloomPass(new THREE.Vector2(1, 1), 0.0, 0.45, 0.72);
-  composer.addPass(bloom);
-  composer.addPass(new OutputPass());
+  // WEAK_MACHINE skips the composer entirely rather than running it with bloom at zero strength:
+  // UnrealBloomPass does its blur passes regardless of strength, and EffectComposer's own extra
+  // render-to-texture passes (RenderPass, OutputPass) cost real time a direct renderer.render
+  // does not. The renderer's own toneMapping/outputColorSpace still apply without OutputPass.
+  let composer = null, bloom = null;
+  if (!WEAK_MACHINE) {
+    composer = new EffectComposer(renderer);
+    composer.addPass(new RenderPass(scene, camera));
+    bloom = new UnrealBloomPass(new THREE.Vector2(1, 1), 0.0, 0.45, 0.72);
+    composer.addPass(bloom);
+    composer.addPass(new OutputPass());
+  }
 
   // --- rain: daily 16:00-17:00, ~20 sim-minutes of ramp at each edge ------------------------
   const RAIN_N = 1400;
@@ -485,6 +496,20 @@ export function createScene(world) {
     // headlights, for one, which only the police module knows how to find.
     scene.userData.night = night;
     buildings.uniforms.uNight.value = night;
+    // WEAK_MACHINE only: hide building and townhouse chunks beyond CHUNK_CULL_RADIUS of the car.
+    // Infinity on stronger hardware short-circuits this to a no-op — every chunk stays visible, as
+    // before chunking existed, just submitted as more (frustum-cullable) draw calls instead of one.
+    if (followTarget && CHUNK_CULL_RADIUS < Infinity) {
+      const px = followTarget.position.x, pz = followTarget.position.z, r2 = CHUNK_CULL_RADIUS ** 2;
+      for (const c of buildings.cullables) {
+        const dx = c.x - px, dz = c.z - pz;
+        c.mesh.visible = dx * dx + dz * dz < r2;
+      }
+      for (const c of townhouses.cullables) {
+        const dx = c.x - px, dz = c.z - pz;
+        c.mesh.visible = dx * dx + dz * dz < r2;
+      }
+    }
     lamps.glows.material.uniforms.uOpacity.value = night * 0.95;
     hemi.intensity = 0.45 + night * 0.55;
     // set (not lerp) from a base each frame so the warm-night tint never accumulates
@@ -534,7 +559,7 @@ export function createScene(world) {
       rp.needsUpdate = true;
     }
     lamps.pools.material.uniforms.uNight.value = night;
-    bloom.strength = night * 0.85;
+    if (bloom) bloom.strength = night * 0.85;
     if (neon) { neon.signs.material.opacity = 0.25 + night * 0.75; neon.glows.material.opacity = night * 0.4; } // day: zero, dusk ramps in, full halo at night
     renderer.toneMappingExposure = 1.05 + night * 0.25;
 
@@ -558,12 +583,13 @@ export function createScene(world) {
 
   function resize(w, h) {
     camera.aspect = w / h; camera.updateProjectionMatrix(); renderer.setSize(w, h);
-    composer.setSize(w, h);
+    if (composer) composer.setSize(w, h);
   }
 
   // The frame loop should call THIS rather than renderer.render — it is the same draw plus
-  // the bloom chain. renderer stays exported so a fallback loop still shows a picture.
-  function render() { composer.render(); }
+  // the bloom chain (skipped under WEAK_MACHINE). renderer stays exported so a fallback loop
+  // still shows a picture.
+  function render() { if (composer) composer.render(); else renderer.render(scene, camera); }
 
   // What the editor's pointer is allowed to touch. Everything the city BAKES — ground, roads,
   // pavements, the building shells, the terraces, the trees — is one merged mesh per tile holding
@@ -1086,20 +1112,41 @@ function buildPontRouge(world) {
   return group;
 }
 
-// One merged extrusion for every building; the facade lives in the fragment shader.
-// Per-fragment window grid from world position: zero textures, crisp at any distance,
-// per-window pseudo-random warm light at night. uNight fades the whole city's windows in.
+// Extruded per spatial chunk rather than one city-spanning mesh; the facade lives in the fragment
+// shader regardless. Per-fragment window grid from world position: zero textures, crisp at any
+// distance, per-window pseudo-random warm light at night. uNight fades the whole city's windows in.
+//
+// CHUNK_SIZE buckets buildings by footprint centroid before extrusion, one BufferGeometry per
+// occupied cell, all sharing one material — so draw calls stay proportional to occupied area
+// rather than jumping to one-per-building, but each chunk gets its OWN bounding sphere instead of
+// one that spans the whole city. That is what lets Three's ordinary frustum culling (and, under
+// CHUNK_CULL_RADIUS, distance culling in `update`) actually skip anything.
+const CHUNK_SIZE = 150;
+
 function buildBuildings(world) {
-  const pos = [], norm = [], rnd = [], idx = [], bas = [];
-  let v = 0;
+  const chunks = new Map();
+  const chunkAt = (mx, my) => {
+    const ccx = Math.floor(mx / CHUNK_SIZE), ccy = Math.floor(my / CHUNK_SIZE);
+    const key = `${ccx}:${ccy}`;
+    let c = chunks.get(key);
+    if (!c) chunks.set(key, c = {pos: [], norm: [], rnd: [], idx: [], bas: [], v: 0, ccx, ccy});
+    return c;
+  };
+
   for (const bl of world.buildings) {
     const pts = bl.pts, n = pts.length, h = bl.h, seed = Math.random();
     // Drop degenerate footprints: OSM building:part and barrier=wall outlines can be a sliver
     // (2 points, or a near-zero-area strip) and extrude into a 2D wall standing on edge — the
     // "thin wall" artifact. A real building encloses area; require it.
-    let area2 = 0;
-    for (let i = 0; i < n - 1; i++) area2 += pts[i][0] * pts[i + 1][1] - pts[i + 1][0] * pts[i][1];
+    let area2 = 0, cx = 0, cy = 0;
+    for (let i = 0; i < n - 1; i++) {
+      area2 += pts[i][0] * pts[i + 1][1] - pts[i + 1][0] * pts[i][1];
+      cx += pts[i][0]; cy += pts[i][1];
+    }
     if (n < 4 || Math.abs(area2) < 12) continue;
+    const chunk = chunkAt(cx / (n - 1), cy / (n - 1));
+    const {pos, norm, rnd, idx, bas} = chunk;
+    let v = chunk.v;
     // Seat the building at its footprint CENTROID's ground — where it meets the street — minus a
     // small 0.3m bury. Seating at the lowest corner sank street-facing storefronts below the road on
     // sloped footprints; the centroid keeps the visible face at street level. Top is floor + height.
@@ -1133,13 +1180,8 @@ function buildBuildings(world) {
     for (const tri of THREE.ShapeUtils.triangulateShape(flat, [])) {
       idx.push(roofStart + tri[0], roofStart + tri[2], roofStart + tri[1]);
     }
+    chunk.v = v;
   }
-  const g = new THREE.BufferGeometry();
-  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
-  g.setAttribute('aBase', new THREE.Float32BufferAttribute(bas, 1));
-  g.setAttribute('normal', new THREE.Float32BufferAttribute(norm, 3));
-  g.setAttribute('aRnd', new THREE.Float32BufferAttribute(rnd, 1));
-  g.setIndex(idx);
 
   const uniforms = {
     uNight: {value: 0},
@@ -1253,12 +1295,27 @@ function buildBuildings(world) {
         #include <fog_fragment>
       }`,
   });
-  const mesh = new THREE.Mesh(g, mat);
-  mesh.castShadow = true;
-  mesh.receiveShadow = true;
+
+  const group = new THREE.Group();
+  const cullables = [];
+  for (const c of chunks.values()) {
+    if (!c.idx.length) continue;
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(c.pos, 3));
+    g.setAttribute('aBase', new THREE.Float32BufferAttribute(c.bas, 1));
+    g.setAttribute('normal', new THREE.Float32BufferAttribute(c.norm, 3));
+    g.setAttribute('aRnd', new THREE.Float32BufferAttribute(c.rnd, 1));
+    g.setIndex(c.idx);
+    const mesh = new THREE.Mesh(g, mat);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    group.add(mesh);
+    // Chunk centre in world space, for distance culling — three.x = map.x, three.z = -map.y.
+    cullables.push({mesh, x: (c.ccx + 0.5) * CHUNK_SIZE, z: -(c.ccy + 0.5) * CHUNK_SIZE});
+  }
   // UniformsUtils.merge CLONES its inputs, so the local `uniforms` object is not what the
   // material reads — updating it moved nothing on screen. Hand back the material's own.
-  return {mesh, uniforms: mat.uniforms};
+  return {mesh: group, uniforms: mat.uniforms, cullables};
 }
 
 function buildPolys(polys, color, y) {
@@ -1670,21 +1727,30 @@ function buildTownhouseFrontages(world) {
   // where the camera looked. One merged mesh per TILE keeps the draw calls low (only the handful of
   // tiles on screen are drawn) and finally lets the frustum test do its job.
   const group = new THREE.Group();
+  const cullables = [];
   if (houses.length) {
     const tiles = new Map();
     for (const h of houses) {
-      const key = `${Math.floor(h.x / TILE)}:${Math.floor(h.z / TILE)}`;
+      const ccx = Math.floor(h.x / TILE), ccz = Math.floor(h.z / TILE);
+      const key = `${ccx}:${ccz}`;
       const bucket = tiles.get(key);
-      if (bucket) bucket.push(h); else tiles.set(key, [h]);
+      if (bucket) bucket.houses.push(h); else tiles.set(key, {houses: [h], ccx, ccz});
     }
-    for (const bucket of tiles.values()) group.add(buildTownhouseRow(bucket));
+    for (const {houses: bucket, ccx, ccz} of tiles.values()) {
+      const mesh = buildTownhouseRow(bucket);
+      group.add(mesh);
+      cullables.push({mesh, x: (ccx + 0.5) * TILE, z: (ccz + 0.5) * TILE});
+    }
   }
+  group.cullables = cullables;
   return group;
 }
 
 /** Side of a culling tile, metres. Small enough that most of the city is off screen, large enough
- *  that the draw-call count stays sane. */
-const TILE = 260;
+ *  that the draw-call count stays sane. 140 rather than the original 260: measured as the single
+ *  largest triangle cost in the scene (over 10M scene-wide before culling, against ~110k for every
+ *  building put together) — a tighter tile pays for itself here more than almost anywhere else. */
+const TILE = 140;
 
 // Dress the pavements. Walk the busier streets and, every ~40m, drop a prop just past the
 // carriageway edge facing the street. The TYPE is chosen by a stable per-site hash so the mix is
